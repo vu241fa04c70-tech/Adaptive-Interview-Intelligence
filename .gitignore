@@ -1,0 +1,21 @@
+# Environment & Secrets
+.env
+*.env
+
+# Python
+venv/
+ENV/
+__pycache__/
+*.pyc
+*.pyo
+proofhire.db
+
+# Node / Frontend
+frontend/node_modules/
+frontend/dist/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
