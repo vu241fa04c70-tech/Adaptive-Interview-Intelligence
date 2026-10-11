@@ -46,6 +46,30 @@ function getAuthHeaders(): HeadersInit {
   return headers;
 }
 
+async function handleApiResponse<T = any>(res: Response, fallbackMessage: string): Promise<T> {
+  const contentType = res.headers.get('content-type') || '';
+  if (!res.ok) {
+    if (contentType.includes('application/json')) {
+      const errorData = await res.json().catch(() => ({}));
+      throw new Error(errorData.detail || fallbackMessage);
+    }
+    if (res.status === 404 || contentType.includes('text/html')) {
+      throw new Error(
+        `Backend API unreachable (HTTP ${res.status}). If deployed on Vercel, please connect your backend server by adding VITE_API_BASE_URL in your Vercel Project Settings.`
+      );
+    }
+    throw new Error(`${fallbackMessage} (HTTP ${res.status})`);
+  }
+
+  if (contentType.includes('text/html')) {
+    throw new Error(
+      `Received HTML instead of JSON from API. If deployed on Vercel, please configure VITE_API_BASE_URL in your Vercel Project Settings to your deployed backend URL.`
+    );
+  }
+
+  return res.json();
+}
+
 // -------------------------------------------------------------
 // Authentication Endpoints
 // -------------------------------------------------------------
@@ -60,11 +84,7 @@ export async function registerUser(data: {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(data)
   });
-  if (!res.ok) {
-    const errorData = await res.json().catch(() => ({}));
-    throw new Error(errorData.detail || 'Registration failed');
-  }
-  const result: AuthResponse = await res.json();
+  const result: AuthResponse = await handleApiResponse(res, 'Registration failed');
   if (result.access_token) {
     setStoredToken(result.access_token);
   }
@@ -80,11 +100,7 @@ export async function loginUser(data: {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(data)
   });
-  if (!res.ok) {
-    const errorData = await res.json().catch(() => ({}));
-    throw new Error(errorData.detail || 'Invalid email or password');
-  }
-  const result: AuthResponse = await res.json();
+  const result: AuthResponse = await handleApiResponse(res, 'Invalid email or password');
   if (result.access_token) {
     setStoredToken(result.access_token);
   }
@@ -107,11 +123,7 @@ export async function googleLogin(
       name
     })
   });
-  if (!res.ok) {
-    const errorData = await res.json().catch(() => ({}));
-    throw new Error(errorData.detail || 'Google sign-in failed');
-  }
-  const result: AuthResponse = await res.json();
+  const result: AuthResponse = await handleApiResponse(res, 'Google sign-in failed');
   if (result.access_token) {
     setStoredToken(result.access_token);
   }
@@ -129,11 +141,7 @@ export async function sendPasswordResetOtp(email: string): Promise<{
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ email })
   });
-  if (!res.ok) {
-    const errorData = await res.json().catch(() => ({}));
-    throw new Error(errorData.detail || 'Failed to send verification code. Please check your email.');
-  }
-  return res.json();
+  return handleApiResponse(res, 'Failed to send verification code. Please check your email.');
 }
 
 export async function verifyPasswordResetOtp(
@@ -146,11 +154,7 @@ export async function verifyPasswordResetOtp(
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ email, otp, new_password: newPassword })
   });
-  if (!res.ok) {
-    const errorData = await res.json().catch(() => ({}));
-    throw new Error(errorData.detail || 'Verification failed. Invalid or expired OTP code.');
-  }
-  const result: AuthResponse = await res.json();
+  const result: AuthResponse = await handleApiResponse(res, 'Verification failed. Invalid or expired OTP code.');
   if (result.access_token) {
     setStoredToken(result.access_token);
   }
@@ -168,10 +172,12 @@ export async function getCurrentUser(): Promise<User> {
     }
   });
   if (!res.ok) {
-    removeStoredToken();
-    throw new Error('Session expired or unauthorized');
+    if (res.status === 401) {
+      removeStoredToken();
+    }
+    return handleApiResponse(res, 'Session expired or unauthorized');
   }
-  return res.json();
+  return handleApiResponse(res, 'Failed to load user profile');
 }
 
 export async function logoutUser(): Promise<void> {
@@ -194,22 +200,14 @@ export async function resetPassword(email: string, new_password: string): Promis
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ email, new_password })
   });
-  if (!res.ok) {
-    const errorData = await res.json().catch(() => ({}));
-    throw new Error(errorData.detail || 'Password reset failed');
-  }
-  return res.json();
+  return handleApiResponse(res, 'Password reset failed');
 }
 
 export async function fetchAdminUsers(): Promise<User[]> {
   const res = await fetch(`${API_BASE}/auth/admin/users`, {
     headers: getAuthHeaders()
   });
-  if (!res.ok) {
-    const errorData = await res.json().catch(() => ({}));
-    throw new Error(errorData.detail || 'Failed to fetch platform users');
-  }
-  return res.json();
+  return handleApiResponse(res, 'Failed to fetch platform users');
 }
 
 // -------------------------------------------------------------
