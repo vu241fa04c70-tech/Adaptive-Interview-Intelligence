@@ -1,0 +1,17 @@
+.git
+.gitignore
+.env
+*.env
+backend/.env
+venv/
+ENV/
+__pycache__/
+*.pyc
+*.pyo
+proofhire.db
+frontend/node_modules/
+frontend/dist/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
