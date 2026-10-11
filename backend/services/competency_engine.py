@@ -122,15 +122,17 @@ def update_competency_status(
                 return comp_map
 
     item = comp_map[target_competency]
-    prev_score = item["score"]
-    count = item["evidence_count"]
+    prev_score = item.get("score", 0.0)
+    count = item.get("evidence_count", 0)
+    tested_q = item.get("tested_questions", [])
     
     # Running average score
     new_score = ((prev_score * count) + score) / (count + 1)
     item["score"] = round(new_score, 2)
     item["evidence_count"] = count + 1
-    if question_idx not in item["tested_questions"]:
-        item["tested_questions"].append(question_idx)
+    if question_idx not in tested_q:
+        tested_q.append(question_idx)
+    item["tested_questions"] = tested_q
 
     # Determine status
     if new_score >= 3.0:

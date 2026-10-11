@@ -57,6 +57,15 @@ class CreateInterviewRequest(BaseModel):
     interview_type: str = "mixed" # technical, behavioral, project_based, mixed
     mode: str = "text" # text, voice
 
+# Module 01 Adaptation Pipeline
+class AdaptationPipelineSchema(BaseModel):
+    question_area: str
+    competency_coverage: str
+    question_relevance: str
+    difficulty_selection: str
+    next_question: str
+    reason_for_next_question: str
+
 class QuestionAnswerSchema(BaseModel):
     id: int
     question_index: int
@@ -74,6 +83,7 @@ class QuestionAnswerSchema(BaseModel):
     score: float
     rubric_scores: Dict[str, float] = Field(default_factory=dict)
     reason_for_next_question: Optional[str]
+    adaptation_pipeline: Optional[Dict[str, Any]] = Field(default_factory=dict)
     confidence: float
     created_at: datetime
 
@@ -96,7 +106,29 @@ class InterviewSessionResponse(BaseModel):
     status: str
     competency_map: Dict[str, CompetencyStatus]
     qa_history: List[QuestionAnswerSchema] = Field(default_factory=list)
+    integrity_events_count: int = 0
     created_at: datetime
+
+# Module 03 Integrity Events Schemas
+class IntegrityEventRequest(BaseModel):
+    event_type: str # TAB_SWITCH, PASTE_DETECTED, SPEECH_PAUSE, AUDIO_ANOMALY, SPEED_ANOMALY, GAZE_DEVIATION
+    details: Optional[str] = None
+    confidence: float = 0.9
+
+class IntegrityEventResponse(BaseModel):
+    success: bool
+    event_type: str
+    total_events: int
+    message: str
+
+class IntegrityRiskProfileSchema(BaseModel):
+    risk_level: str # low, medium, high
+    risk_score: float # 0 to 100
+    summary: str
+    events_timeline: List[Dict[str, Any]] = Field(default_factory=list)
+    flagged_counts: Dict[str, int] = Field(default_factory=dict)
+    requires_human_review: bool = False
+    explainable_risk_profile: str
 
 # Submit Answer Schema
 class SubmitAnswerRequest(BaseModel):
@@ -112,6 +144,7 @@ class SubmitAnswerResponse(BaseModel):
     missing_concepts: List[str]
     evidence: List[Dict[str, Any]]
     reason_for_next_question: str
+    adaptation_pipeline: Optional[Dict[str, Any]] = Field(default_factory=dict)
     
     # Next question info
     is_interview_complete: bool
@@ -122,7 +155,7 @@ class SubmitAnswerResponse(BaseModel):
     next_target_competency: Optional[str]
     updated_competency_map: Dict[str, CompetencyStatus]
 
-# Final Report Schemas
+# Module 04 & 05 Report & Decision Schemas
 class SkillGapItem(BaseModel):
     competency: str
     claimed_in_resume: bool
@@ -130,6 +163,15 @@ class SkillGapItem(BaseModel):
     demonstrated_score: float
     status: str
     evidence_summary: str
+
+class DecisionIntelligenceSchema(BaseModel):
+    overall_fit_recommendation: str
+    fit_confidence_score: float
+    weighted_rubric_scores: Dict[str, float] = Field(default_factory=dict)
+    role_alignment_summary: str
+    unresolved_uncertainties: List[str] = Field(default_factory=list)
+    key_evidence_quotes: List[Dict[str, Any]] = Field(default_factory=list)
+    recruiter_action_plan: List[str] = Field(default_factory=list)
 
 class FinalReportResponse(BaseModel):
     session_id: str
@@ -139,12 +181,18 @@ class FinalReportResponse(BaseModel):
     duration_minutes: int
     total_questions: int
     overall_score: float # 0 - 100
+    interview_score: Optional[float] = None
+    job_fit_percentage: Optional[float] = None
+    job_fit_status: Optional[str] = None
+    job_fit_breakdown: Optional[Dict[str, Any]] = Field(default_factory=dict)
     summary: str
     competency_breakdown: Dict[str, CompetencyStatus]
     strengths: List[str]
     areas_for_improvement: List[str]
     skill_gap_matrix: List[SkillGapItem]
     qa_details: List[QuestionAnswerSchema]
+    integrity_risk_profile: Optional[Dict[str, Any]] = Field(default_factory=dict)
+    decision_intelligence: Optional[Dict[str, Any]] = Field(default_factory=dict)
     suggested_practice_questions: List[Dict[str, str]]
     learning_roadmap: List[Dict[str, Any]]
     recruiter_next_steps: List[str]
@@ -161,6 +209,8 @@ class RecruiterCandidateOverview(BaseModel):
     status: str
     top_strengths: List[str]
     key_gaps: List[str]
+    integrity_risk_level: str = "low"
+    decision_recommendation: str = "PROCEED_WITH_DEEP_DIVE"
 
 class RecruiterAnalyticsResponse(BaseModel):
     total_interviews: int

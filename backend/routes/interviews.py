@@ -1,32 +1,51 @@
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from typing import List, Dict, Any
 
 from database import get_db
-from models import Candidate, JobDescription, InterviewSession, QuestionAnswer, EvaluationReport
+from models import Candidate, JobDescription, InterviewSession, QuestionAnswer, EvaluationReport, User
 from schemas import (
     CreateInterviewRequest,
     InterviewSessionResponse,
     SubmitAnswerRequest,
     SubmitAnswerResponse,
     FinalReportResponse,
-    QuestionAnswerSchema
+    QuestionAnswerSchema,
+    IntegrityEventRequest,
+    IntegrityEventResponse
 )
 from services.job_parser import parse_job_description
 from services.competency_engine import get_role_competency_map
 from services.adaptive_engine import generate_opening_question, evaluate_and_generate_next
 from services.report_generator import generate_final_report
+from services.integrity_engine import classify_event
+from routes.auth import get_optional_current_user
 
 router = APIRouter(prefix="/api/interviews", tags=["interviews"])
 
 @router.post("/create", response_model=InterviewSessionResponse)
-def create_interview(req: CreateInterviewRequest, db: Session = Depends(get_db)):
-    # 1. Candidate record
+def create_interview(
+    req: CreateInterviewRequest,
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_optional_current_user)
+):
+    candidate_name = req.candidate_name
+    candidate_email = req.candidate_email
+
+    if current_user:
+        if not candidate_name or candidate_name.strip().lower() in ["candidate", "unknown", ""]:
+            candidate_name = current_user.name
+        if not candidate_email:
+            candidate_email = current_user.email
+    elif not candidate_name:
+        candidate_name = "Candidate"
+
     candidate = Candidate(
-        name=req.candidate_name,
-        email=req.candidate_email,
+        user_id=current_user.id if current_user else None,
+        name=candidate_name,
+        email=candidate_email,
         raw_resume_text=req.raw_resume_text,
         parsed_skills=req.parsed_skills,
         parsed_projects=req.parsed_projects,
@@ -37,7 +56,6 @@ def create_interview(req: CreateInterviewRequest, db: Session = Depends(get_db))
     db.add(candidate)
     db.flush()
 
-    # 2. Job Description record
     parsed_jd = parse_job_description(req.job_title, "Target Company", req.job_description_text)
     job_desc = JobDescription(
         title=req.job_title,
@@ -51,13 +69,12 @@ def create_interview(req: CreateInterviewRequest, db: Session = Depends(get_db))
     db.add(job_desc)
     db.flush()
 
-    # 3. Competency Map initialization
     initial_comp_map = get_role_competency_map(req.job_title, parsed_jd.get("required_skills", []))
 
-    # 4. Interview Session record
     session_id = str(uuid.uuid4())
     session = InterviewSession(
         id=session_id,
+        user_id=current_user.id if current_user else None,
         candidate_id=candidate.id,
         job_id=job_desc.id,
         role=req.job_title,
@@ -66,7 +83,8 @@ def create_interview(req: CreateInterviewRequest, db: Session = Depends(get_db))
         mode=req.mode,
         interview_type=req.interview_type,
         status="created",
-        competency_map=initial_comp_map
+        competency_map=initial_comp_map,
+        integrity_events=[]
     )
     db.add(session)
     db.commit()
@@ -76,11 +94,48 @@ def create_interview(req: CreateInterviewRequest, db: Session = Depends(get_db))
 
 
 @router.get("/{session_id}", response_model=InterviewSessionResponse)
-def get_interview(session_id: str, db: Session = Depends(get_db)):
+def get_interview(
+    session_id: str,
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_optional_current_user)
+):
     session = db.query(InterviewSession).filter(InterviewSession.id == session_id).first()
     if not session:
         raise HTTPException(status_code=404, detail="Interview session not found")
+
+    # Access control: If session belongs to a user, only that user or an admin can view it
+    if session.user_id:
+        if not current_user:
+            raise HTTPException(status_code=401, detail="Authentication required to view this interview session.")
+        if current_user.role != "admin" and current_user.id != session.user_id:
+            raise HTTPException(status_code=403, detail="Forbidden: You cannot access another candidate's interview session.")
+
     return get_session_response(session, db)
+
+
+@router.post("/{session_id}/integrity-event", response_model=IntegrityEventResponse)
+def record_integrity_event(session_id: str, req: IntegrityEventRequest, db: Session = Depends(get_db)):
+    """
+    Module 03 Endpoint: Logs real-time interview integrity observations from candidate workspace.
+    """
+    session = db.query(InterviewSession).filter(InterviewSession.id == session_id).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="Interview session not found")
+
+    classified = classify_event(req.event_type, req.details or "", req.confidence)
+    classified["timestamp"] = datetime.now(timezone.utc).isoformat()
+
+    current_events = list(session.integrity_events or [])
+    current_events.append(classified)
+    session.integrity_events = current_events
+    db.commit()
+
+    return IntegrityEventResponse(
+        success=True,
+        event_type=classified["event_type"],
+        total_events=len(current_events),
+        message=f"Logged {classified['event_name']} ({classified['severity']} severity)"
+    )
 
 
 @router.post("/{session_id}/start")
@@ -90,7 +145,6 @@ def start_interview(session_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Interview session not found")
 
     if session.status != "created" and len(session.qa_pairs) > 0:
-        # Already started
         first_qa = session.qa_pairs[0]
         return {
             "session_id": session.id,
@@ -101,7 +155,8 @@ def start_interview(session_id: str, db: Session = Depends(get_db)):
                 "question_type": first_qa.question_type,
                 "target_competency": first_qa.target_competency,
                 "difficulty": first_qa.difficulty,
-                "reason_for_next_question": first_qa.reason_for_next_question
+                "reason_for_next_question": first_qa.reason_for_next_question,
+                "adaptation_pipeline": first_qa.adaptation_pipeline
             }
         }
 
@@ -131,7 +186,6 @@ def start_interview(session_id: str, db: Session = Depends(get_db)):
         competencies=competencies
     )
 
-    # Store Q1 in database
     qa = QuestionAnswer(
         session_id=session.id,
         question_index=1,
@@ -139,10 +193,11 @@ def start_interview(session_id: str, db: Session = Depends(get_db)):
         question_type=opening.get("question_type", "opening"),
         target_competency=opening.get("target_competency", competencies[0]),
         difficulty=opening.get("difficulty", session.target_difficulty),
-        reason_for_next_question=opening.get("reason_for_next_question")
+        reason_for_next_question=opening.get("reason_for_next_question"),
+        adaptation_pipeline=opening.get("adaptation_pipeline", {})
     )
     session.status = "in_progress"
-    session.start_time = datetime.utcnow()
+    session.start_time = datetime.now(timezone.utc)
     db.add(qa)
     db.commit()
 
@@ -155,7 +210,8 @@ def start_interview(session_id: str, db: Session = Depends(get_db)):
             "question_type": qa.question_type,
             "target_competency": qa.target_competency,
             "difficulty": qa.difficulty,
-            "reason_for_next_question": qa.reason_for_next_question
+            "reason_for_next_question": qa.reason_for_next_question,
+            "adaptation_pipeline": qa.adaptation_pipeline
         }
     }
 
@@ -174,7 +230,6 @@ def submit_answer(session_id: str, req: SubmitAnswerRequest, db: Session = Depen
     current_qa.candidate_answer = req.answer_text
     current_qa.answer_time_seconds = req.answer_time_seconds
 
-    # Build Q&A history for context
     history_dict = []
     for qa in qa_list[:-1]:
         history_dict.append({
@@ -202,7 +257,6 @@ def submit_answer(session_id: str, req: SubmitAnswerRequest, db: Session = Depen
         "difficulty": current_qa.difficulty
     }
 
-    # Evaluate answer & generate next adaptive question
     eval_res = evaluate_and_generate_next(
         session_id=session.id,
         role=session.role,
@@ -217,7 +271,6 @@ def submit_answer(session_id: str, req: SubmitAnswerRequest, db: Session = Depen
         job_description=parsed_jd
     )
 
-    # Save current QA evaluation
     current_qa.answer_summary = eval_res.get("answer_summary")
     current_qa.score = float(eval_res.get("score", 2.0))
     current_qa.rubric_scores = eval_res.get("rubric_scores", {})
@@ -226,13 +279,13 @@ def submit_answer(session_id: str, req: SubmitAnswerRequest, db: Session = Depen
     current_qa.evidence = eval_res.get("evidence", [])
     current_qa.uncertainties = eval_res.get("uncertainties", [])
 
-    # Update session competency map
     updated_map = eval_res.get("updated_competency_map", session.competency_map)
     session.competency_map = updated_map
 
     is_complete = bool(eval_res.get("is_interview_complete", False))
     next_index = len(qa_list) + 1 if not is_complete else None
     next_text = eval_res.get("next_question_text") if not is_complete else None
+    adaptation_pipe = eval_res.get("adaptation_pipeline", {})
 
     if not is_complete and next_text:
         next_qa = QuestionAnswer(
@@ -242,13 +295,14 @@ def submit_answer(session_id: str, req: SubmitAnswerRequest, db: Session = Depen
             question_type=eval_res.get("next_question_type", "follow_up"),
             target_competency=eval_res.get("next_target_competency"),
             difficulty=eval_res.get("next_question_difficulty", session.target_difficulty),
-            reason_for_next_question=eval_res.get("reason_for_next_question")
+            reason_for_next_question=eval_res.get("reason_for_next_question"),
+            adaptation_pipeline=adaptation_pipe
         )
         db.add(next_qa)
 
     if is_complete:
         session.status = "completed"
-        session.end_time = datetime.utcnow()
+        session.end_time = datetime.now(timezone.utc)
 
     db.commit()
 
@@ -261,6 +315,7 @@ def submit_answer(session_id: str, req: SubmitAnswerRequest, db: Session = Depen
         missing_concepts=current_qa.missing_concepts,
         evidence=current_qa.evidence,
         reason_for_next_question=eval_res.get("reason_for_next_question", ""),
+        adaptation_pipeline=adaptation_pipe,
         is_interview_complete=is_complete,
         next_question_index=next_index,
         next_question_text=next_text,
@@ -279,9 +334,8 @@ def end_interview(session_id: str, db: Session = Depends(get_db)):
 
     session.status = "completed"
     if not session.end_time:
-        session.end_time = datetime.utcnow()
+        session.end_time = datetime.now(timezone.utc)
 
-    # Generate or fetch report
     if not session.report:
         candidate = session.candidate
         job_desc = session.job_description
@@ -301,7 +355,8 @@ def end_interview(session_id: str, db: Session = Depends(get_db)):
                 "demonstrated_concepts": qa.demonstrated_concepts,
                 "missing_concepts": qa.missing_concepts,
                 "evidence": qa.evidence,
-                "reason_for_next_question": qa.reason_for_next_question
+                "reason_for_next_question": qa.reason_for_next_question,
+                "adaptation_pipeline": qa.adaptation_pipeline
             })
 
         parsed_resume = {
@@ -322,7 +377,8 @@ def end_interview(session_id: str, db: Session = Depends(get_db)):
             competency_map=session.competency_map,
             qa_list=qa_dicts,
             parsed_resume=parsed_resume,
-            job_description=parsed_jd
+            job_description=parsed_jd,
+            integrity_events=session.integrity_events or []
         )
 
         db_report = EvaluationReport(
@@ -333,6 +389,8 @@ def end_interview(session_id: str, db: Session = Depends(get_db)):
             strengths=report_data["strengths"],
             areas_for_improvement=report_data["areas_for_improvement"],
             skill_gap_analysis={"matrix": report_data["skill_gap_matrix"]},
+            integrity_risk_profile=report_data.get("integrity_risk_profile", {}),
+            decision_intelligence=report_data.get("decision_intelligence", {}),
             suggested_practice_questions=report_data["suggested_practice_questions"],
             learning_roadmap=report_data["learning_roadmap"],
             recruiter_next_steps=report_data["recruiter_next_steps"],
@@ -345,13 +403,23 @@ def end_interview(session_id: str, db: Session = Depends(get_db)):
 
 
 @router.get("/{session_id}/report", response_model=FinalReportResponse)
-def get_report(session_id: str, db: Session = Depends(get_db)):
+def get_report(
+    session_id: str,
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_optional_current_user)
+):
     session = db.query(InterviewSession).filter(InterviewSession.id == session_id).first()
     if not session:
         raise HTTPException(status_code=404, detail="Interview session not found")
 
+    # Access control: If session belongs to a user, enforce ownership or admin role
+    if session.user_id:
+        if not current_user:
+            raise HTTPException(status_code=401, detail="Authentication required to view this evaluation report.")
+        if current_user.role != "admin" and current_user.id != session.user_id:
+            raise HTTPException(status_code=403, detail="Forbidden: You cannot access another candidate's evaluation report.")
+
     if not session.report:
-        # Trigger report generation
         end_interview(session_id, db)
         db.refresh(session)
 
@@ -377,11 +445,17 @@ def get_report(session_id: str, db: Session = Depends(get_db)):
             score=qa.score or 0.0,
             rubric_scores=qa.rubric_scores or {},
             reason_for_next_question=qa.reason_for_next_question,
+            adaptation_pipeline=qa.adaptation_pipeline or {},
             confidence=qa.confidence or 0.9,
             created_at=qa.created_at
         ))
 
     skill_matrix = report.skill_gap_analysis.get("matrix", []) if report.skill_gap_analysis else []
+    dec_intel = report.decision_intelligence or {}
+    interview_score = dec_intel.get("interview_score", report.overall_score)
+    job_fit_percentage = dec_intel.get("job_fit_percentage", round(min(100.0, max(20.0, report.overall_score * 0.95)), 1))
+    job_fit_status = dec_intel.get("job_fit_status", "Good Match" if job_fit_percentage >= 70 else "Moderate Fit")
+    job_fit_breakdown = dec_intel.get("job_fit_breakdown", {})
 
     return FinalReportResponse(
         session_id=session.id,
@@ -391,12 +465,18 @@ def get_report(session_id: str, db: Session = Depends(get_db)):
         duration_minutes=session.duration_minutes,
         total_questions=len(qa_schemas),
         overall_score=report.overall_score,
+        interview_score=interview_score,
+        job_fit_percentage=job_fit_percentage,
+        job_fit_status=job_fit_status,
+        job_fit_breakdown=job_fit_breakdown,
         summary=report.summary,
         competency_breakdown=session.competency_map,
         strengths=report.strengths or [],
         areas_for_improvement=report.areas_for_improvement or [],
         skill_gap_matrix=skill_matrix,
         qa_details=qa_schemas,
+        integrity_risk_profile=report.integrity_risk_profile or {},
+        decision_intelligence=report.decision_intelligence or {},
         suggested_practice_questions=report.suggested_practice_questions or [],
         learning_roadmap=report.learning_roadmap or [],
         recruiter_next_steps=report.recruiter_next_steps or [],
@@ -405,8 +485,29 @@ def get_report(session_id: str, db: Session = Depends(get_db)):
 
 
 @router.get("", response_model=List[InterviewSessionResponse])
-def list_interviews(db: Session = Depends(get_db)):
-    sessions = db.query(InterviewSession).order_by(InterviewSession.created_at.desc()).all()
+def list_interviews(
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_optional_current_user)
+):
+    if current_user:
+        if current_user.role == "admin":
+            sessions = db.query(InterviewSession).order_by(InterviewSession.created_at.desc()).all()
+        else:
+            sessions = (
+                db.query(InterviewSession)
+                .filter(InterviewSession.user_id == current_user.id)
+                .order_by(InterviewSession.created_at.desc())
+                .all()
+            )
+    else:
+        # Guests see only unassociated interviews
+        sessions = (
+            db.query(InterviewSession)
+            .filter(InterviewSession.user_id == None)
+            .order_by(InterviewSession.created_at.desc())
+            .all()
+        )
+
     res = []
     for s in sessions:
         res.append(get_session_response(s, db))
@@ -436,6 +537,7 @@ def get_session_response(session: InterviewSession, db: Session) -> InterviewSes
             score=qa.score or 0.0,
             rubric_scores=qa.rubric_scores or {},
             reason_for_next_question=qa.reason_for_next_question,
+            adaptation_pipeline=qa.adaptation_pipeline or {},
             confidence=qa.confidence or 0.9,
             created_at=qa.created_at
         ))
@@ -452,5 +554,6 @@ def get_session_response(session: InterviewSession, db: Session) -> InterviewSes
         status=session.status,
         competency_map=session.competency_map or {},
         qa_history=qa_schemas,
+        integrity_events_count=len(session.integrity_events or []),
         created_at=session.created_at
     )

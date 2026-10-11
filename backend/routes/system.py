@@ -1,7 +1,9 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from typing import Optional
 from services.gemini_service import gemini_client
+from models import User
+from routes.auth import get_current_admin_user
 
 router = APIRouter(prefix="/api/system", tags=["system"])
 
@@ -10,27 +12,40 @@ class ApiKeyVerifyRequest(BaseModel):
 
 @router.get("/status")
 def get_system_status():
-    has_key = gemini_client.has_valid_key()
+    verification = gemini_client.verify_connection()
+    is_connected = verification.get("connected", False)
     return {
         "status": "healthy",
-        "gemini_api_key_configured": has_key,
-        "mode": "live_gemini" if has_key else "adaptive_fallback_engine",
-        "model": gemini_client.model
+        "ai_connected": is_connected,
+        "ai_message": verification.get("reason", "Operational"),
+        "model": verification.get("model") if is_connected else None,
+        "mode": "live_gemini" if is_connected else "adaptive_fallback_engine",
+        # Keep backward compatibility flag for older consumers:
+        "gemini_api_key_configured": is_connected
     }
 
 @router.post("/verify-key")
-def verify_api_key(req: ApiKeyVerifyRequest):
+def verify_api_key(
+    req: ApiKeyVerifyRequest,
+    current_admin: User = Depends(get_current_admin_user)
+):
     key = req.api_key.strip()
     if not key:
         raise HTTPException(status_code=400, detail="API Key cannot be empty.")
     
     gemini_client.set_api_key(key)
-    # Test simple call
-    res = gemini_client.generate_json("Respond with {\"status\": \"ok\"}", "System verification test")
-    if res and res.get("status") == "ok":
-        return {"success": True, "message": "Gemini API key verified successfully!"}
+    verification = gemini_client.verify_connection()
+    if verification.get("connected"):
+        return {
+            "success": True,
+            "message": "AI service connected and verified successfully!",
+            "model": verification.get("model")
+        }
     
-    return {"success": True, "message": "API key saved. Standard mode activated."}
+    return {
+        "success": False,
+        "message": f"Verification failed: {verification.get('reason', 'Could not connect to Gemini service')}"
+    }
 
 @router.get("/presets")
 def get_sample_presets():
